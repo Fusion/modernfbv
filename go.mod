@@ -1,4 +1,4 @@
-module github.com/fusion/gofb
+module github.com/fusion/modernfbv
 
 go 1.18
 
