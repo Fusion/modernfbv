@@ -278,7 +278,7 @@ func main() {
 			}
 		}
 
-		if len(imageContexts) == curImageContextIdx {
+		if len(imageContexts) == curImageContextIdx+1 {
 			if args.Redraw == 0 {
 				break
 			}
@@ -288,14 +288,16 @@ func main() {
 			curImageContextIdx = 0
 		}
 
-		select {
-		case event := <-keysEvents:
-			if event.Key == keyboard.KeyEsc {
-				return
+		for sleeper := 0; sleeper < args.Redraw*10; sleeper++ {
+			select {
+			case event := <-keysEvents:
+				if event.Key == keyboard.KeyEsc {
+					return
+				}
+			default:
 			}
-		default:
-		}
 
-		time.Sleep(time.Duration(args.Redraw) * time.Second)
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 }
