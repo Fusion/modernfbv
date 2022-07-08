@@ -11,16 +11,22 @@ import (
 	"image/draw"
 	"image/jpeg"
 	"image/png"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/eiannone/keyboard"
+	"golang.org/x/image/font"
+	"golang.org/x/image/font/basicfont"
+	"golang.org/x/image/math/fixed"
 	"golang.org/x/sys/unix"
 
 	arg "github.com/alexflint/go-arg"
 	"github.com/disintegration/imaging"
+
+	"github.com/mackerelio/go-osstat/memory"
 )
 
 type fb_bitfield struct {
@@ -75,6 +81,8 @@ type args struct {
 	DontClear  bool     `help:"do not clear screen before rendering image"`
 	NoCursor   bool     `help:"hide console cursor"`
 	Redraw     int      `help:"keep re-rendering image every n seconds, hiding console output"`
+	Stats      bool     `help:"display server statistics"`
+	Format     []string `arg:"separate" help:"display format for statistics"`
 	Verbose    bool
 }
 
@@ -88,6 +96,31 @@ type imgContext struct {
 	screen_yoffset int
 }
 
+type displayInfo struct {
+	X              int
+	Y              int
+	Size           int
+	Red            uint8
+	Green          uint8
+	Blue           uint8
+	ColorTransform Operation
+	Template       string
+	Output         string // TODO arry
+}
+
+type stats struct {
+	Ram uint64
+	Cpu int
+}
+
+type Operation uint8
+
+const (
+	Col Operation = iota
+	Or
+	Xor
+)
+
 func (args) Description() string {
 	return "Display an image in your graphical console using the frame buffer.\nYou may apply multiple transformations.\n"
 }
@@ -95,6 +128,12 @@ func (args) Description() string {
 func main() {
 	var args args
 	arg.MustParse(&args)
+
+	_, err := parseFormat(args.Format, nil)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 
 	fbF, err := os.OpenFile(args.DevicePath, os.O_RDWR, os.ModeDevice)
 	if err != nil {
@@ -259,11 +298,74 @@ func main() {
 		}
 		imageContext := imageContexts[curImageContextIdx]
 
+		//
+		curStats := stats{}
+		memory, err := memory.Get()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		curStats.Ram = memory.Total
+		//
+		/*
+			fontBytes, err := ioutil.ReadFile("luxisr.ttf")
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+				workFont, err := freetype.ParseFont(fontBytes)
+				if err != nil {
+					fmt.Println(err)
+					return
+				}
+		*/
+		var overlay *image.NRGBA
+		var formatInfoList []displayInfo
+		if args.Stats {
+			// Format:
+			// "X100;Y100;S12;C255,255,255;RAM:{ram}"
+			// C: can be
+			// - R,G,B
+			// - xor
+			// Missing X or Y: try to center
+			formatInfoList, _ = parseFormat(args.Format, &curStats)
+			overlay = image.NewNRGBA(image.Rect(0, 0, screen_width, screen_height))
+			for idx, formatInfo := range formatInfoList {
+				pt := fixed.Point26_6{X: fixed.I(formatInfo.X), Y: fixed.I(formatInfo.Y)}
+				d := &font.Drawer{
+					Dst:  overlay,
+					Src:  image.NewUniform(color.RGBA{255, 255, 255, uint8(idx + 1)}),
+					Face: basicfont.Face7x13,
+					Dot:  pt,
+				}
+				d.DrawString(formatInfo.Output)
+			}
+		}
+		//
+
 		curPixelBit := (imageContext.screen_yoffset*screen_width + imageContext.screen_xoffset) * 4
 		for y := imageContext.image_yoffset; y < imageContext.image_yoffset+imageContext.image_height; y++ {
 			for x := imageContext.image_xoffset; x < imageContext.image_xoffset+imageContext.image_width; x++ {
 				pixColor := imageContext.image.At(x, y)
 				pixColorBits := pixColor.(color.NRGBA)
+				if args.Stats {
+					overlayColor := overlay.At(x, y)
+					overlayColorBits := overlayColor.(color.NRGBA)
+					if overlayColorBits.A != 0 {
+						screenPixels[curPixelBit] = twist(pixColorBits.R, overlayColorBits.R,
+							formatInfoList[overlayColorBits.A-1].ColorTransform, formatInfoList[overlayColorBits.A-1].Red)
+						curPixelBit++
+						screenPixels[curPixelBit] = twist(pixColorBits.G, overlayColorBits.G,
+							formatInfoList[overlayColorBits.A-1].ColorTransform, formatInfoList[overlayColorBits.A-1].Green)
+						curPixelBit++
+						screenPixels[curPixelBit] = twist(pixColorBits.B, overlayColorBits.B,
+							formatInfoList[overlayColorBits.A-1].ColorTransform, formatInfoList[overlayColorBits.A-1].Blue)
+						curPixelBit++
+						screenPixels[curPixelBit] = 255
+						curPixelBit++
+						continue
+					}
+				}
 				screenPixels[curPixelBit] = pixColorBits.R
 				curPixelBit++
 				screenPixels[curPixelBit] = pixColorBits.G
@@ -300,4 +402,89 @@ func main() {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
+}
+
+func twist(component1 uint8, component2 uint8, op Operation, reqcomponent uint8) uint8 {
+	switch op {
+	case Xor:
+		return component1 ^ component2
+	case Or:
+		return component1 | component2
+	default:
+		return reqcomponent
+	}
+}
+
+func parseFormat(formatStrList []string, statsStruct *stats) ([]displayInfo, error) {
+	var err error
+	allinfo := []displayInfo{}
+	for _, formatStr := range formatStrList {
+		info := displayInfo{}
+		format := strings.Split(formatStr, ";")
+		updatedX, updatedY, updatedC := false, false, false
+		for _, hint := range format {
+			if strings.HasPrefix(hint, "X:") {
+				info.X, err = strconv.Atoi(hint[2:])
+				if err != nil {
+					return allinfo, err
+				}
+				updatedX = true
+			} else if strings.HasPrefix(hint, "Y:") {
+				info.Y, err = strconv.Atoi(hint[2:])
+				if err != nil {
+					return allinfo, err
+				}
+				updatedY = true
+			} else if strings.HasPrefix(hint, "S:") {
+				info.Size, err = strconv.Atoi(hint[2:])
+				if err != nil {
+					return allinfo, err
+				}
+			} else if strings.HasPrefix(hint, "C:") {
+				transform := hint[2:]
+				if transform == "xor" {
+					info.ColorTransform = Xor
+				} else if transform == "or" {
+					info.ColorTransform = Or
+				} else {
+					colors := strings.Split(hint[2:], ",")
+					red, err := strconv.Atoi(colors[0])
+					if err != nil {
+						return allinfo, err
+					}
+					green, err := strconv.Atoi(colors[1])
+					if err != nil {
+						return allinfo, err
+					}
+					blue, err := strconv.Atoi(colors[2])
+					if err != nil {
+						return allinfo, err
+					}
+					info.Red, info.Green, info.Blue = uint8(red), uint8(green), uint8(blue)
+				}
+				updatedC = true
+			} else {
+				info.Template = hint
+			}
+		}
+		if !updatedX {
+			info.X = 100
+		}
+		if !updatedY {
+			info.Y = 100
+		}
+		if info.Size == 0 {
+			info.Size = 12
+		}
+		if !updatedC {
+			info.Red = 255
+			info.Green = 255
+			info.Blue = 255
+		}
+		if statsStruct != nil {
+			info.Output = strings.ReplaceAll(info.Template, "{ram}", strconv.FormatUint(statsStruct.Ram, 10))
+		}
+		allinfo = append(allinfo, info)
+	}
+	return allinfo, nil
 }
