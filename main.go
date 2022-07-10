@@ -6,6 +6,7 @@ import (
 	"os"
 )
 import (
+	"bytes"
 	"image"
 	"image/color"
 	"image/draw"
@@ -17,6 +18,8 @@ import (
 	"time"
 	"unsafe"
 
+	"text/template"
+
 	"github.com/eiannone/keyboard"
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/basicfont"
@@ -26,6 +29,8 @@ import (
 	arg "github.com/alexflint/go-arg"
 	"github.com/disintegration/imaging"
 
+	"github.com/dustin/go-humanize"
+	"github.com/mackerelio/go-osstat/cpu"
 	"github.com/mackerelio/go-osstat/memory"
 )
 
@@ -105,12 +110,39 @@ type displayInfo struct {
 	Blue           uint8
 	ColorTransform Operation
 	Template       string
-	Output         string // TODO arry
+	Output         string
+}
+
+type infoTemplate struct {
+	TotalRam  string
+	UsedRam   string
+	FreeRam   string
+	TotalSwap string
+	UsedSwap  string
+	FreeSwap  string
+	CpuUser   string
+	CpuSystem string
+	CpuIdle   string
+}
+
+type ramStatsDetail struct {
+	Total uint64
+	Used  uint64
+	Free  uint64
+}
+
+type cpuStatsDetail struct {
+	Total  uint64
+	User   uint64
+	System uint64
+	Idle   uint64
 }
 
 type stats struct {
-	Ram uint64
-	Cpu int
+	Ram        ramStatsDetail
+	Swap       ramStatsDetail
+	CpuInstant cpuStatsDetail
+	CpuDelta   cpuStatsDetail
 }
 
 type Operation uint8
@@ -129,10 +161,20 @@ func main() {
 	var args args
 	arg.MustParse(&args)
 
-	_, err := parseFormat(args.Format, nil)
+	formatInfo, err := parseFormat(args.Format, nil, nil)
 	if err != nil {
 		fmt.Println(err)
 		return
+	}
+
+	templates := []*template.Template{}
+	for _, formatStr := range formatInfo {
+		oneGoTemplate, err := template.New("display").Parse(formatStr.Template)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		templates = append(templates, oneGoTemplate)
 	}
 
 	fbF, err := os.OpenFile(args.DevicePath, os.O_RDWR, os.ModeDevice)
@@ -286,6 +328,7 @@ func main() {
 	}()
 
 	curImageContextIdx := 0
+	curStats := stats{}
 	for {
 		if !args.DontClear {
 			for i := 0; i < screen_height*screen_width*4; i++ {
@@ -299,13 +342,23 @@ func main() {
 		imageContext := imageContexts[curImageContextIdx]
 
 		//
-		curStats := stats{}
 		memory, err := memory.Get()
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
-		curStats.Ram = memory.Total
+		curStats.Ram = ramStatsDetail{Total: memory.Total, Used: memory.Used, Free: memory.Free}
+		curStats.Swap = ramStatsDetail{Total: memory.SwapTotal, Used: memory.SwapUsed, Free: memory.SwapFree}
+		cpu, err := cpu.Get()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		curStats.CpuDelta.Total = cpu.Total - curStats.CpuInstant.Total
+		curStats.CpuDelta.User = uint64(float64(cpu.User-curStats.CpuInstant.User) / float64(curStats.CpuDelta.Total) * 100)
+		curStats.CpuDelta.System = uint64(float64(cpu.System-curStats.CpuInstant.System) / float64(curStats.CpuDelta.Total) * 100)
+		curStats.CpuDelta.Idle = uint64(float64(cpu.Idle-curStats.CpuInstant.Idle) / float64(curStats.CpuDelta.Total) * 100)
+		curStats.CpuInstant = cpuStatsDetail{Total: cpu.Total, User: cpu.User, System: cpu.System, Idle: cpu.Idle}
 		//
 		/*
 			fontBytes, err := ioutil.ReadFile("luxisr.ttf")
@@ -319,21 +372,25 @@ func main() {
 					return
 				}
 		*/
-		var overlay *image.NRGBA
+		// If we need to display e.g. stats, we are going to create a mask, that we will
+		// then use on the existing picture.
+		// As any basic mask, it is going to use black and white only.
+		// The alpha channel will be used to store the local mask definition index.
+		var mask *image.NRGBA
 		var formatInfoList []displayInfo
 		if args.Stats {
 			// Format:
-			// "X100;Y100;S12;C255,255,255;RAM:{ram}"
+			// "X100;Y100;S12;C255,255,255;RAM:{{.TotalRam}}"
 			// C: can be
 			// - R,G,B
 			// - xor
 			// Missing X or Y: try to center
-			formatInfoList, _ = parseFormat(args.Format, &curStats)
-			overlay = image.NewNRGBA(image.Rect(0, 0, screen_width, screen_height))
+			formatInfoList, _ = parseFormat(args.Format, &curStats, templates)
+			mask = image.NewNRGBA(image.Rect(0, 0, screen_width, screen_height))
 			for idx, formatInfo := range formatInfoList {
 				pt := fixed.Point26_6{X: fixed.I(formatInfo.X), Y: fixed.I(formatInfo.Y)}
 				d := &font.Drawer{
-					Dst:  overlay,
+					Dst:  mask,
 					Src:  image.NewUniform(color.RGBA{255, 255, 255, uint8(idx + 1)}),
 					Face: basicfont.Face7x13,
 					Dot:  pt,
@@ -349,17 +406,17 @@ func main() {
 				pixColor := imageContext.image.At(x, y)
 				pixColorBits := pixColor.(color.NRGBA)
 				if args.Stats {
-					overlayColor := overlay.At(x, y)
-					overlayColorBits := overlayColor.(color.NRGBA)
-					if overlayColorBits.A != 0 {
-						screenPixels[curPixelBit] = twist(pixColorBits.R, overlayColorBits.R,
-							formatInfoList[overlayColorBits.A-1].ColorTransform, formatInfoList[overlayColorBits.A-1].Red)
+					maskColor := mask.At(x, y)
+					maskColorBits := maskColor.(color.NRGBA)
+					if maskColorBits.A != 0 {
+						screenPixels[curPixelBit] = twist(pixColorBits.R, maskColorBits.R,
+							formatInfoList[maskColorBits.A-1].ColorTransform, formatInfoList[maskColorBits.A-1].Red)
 						curPixelBit++
-						screenPixels[curPixelBit] = twist(pixColorBits.G, overlayColorBits.G,
-							formatInfoList[overlayColorBits.A-1].ColorTransform, formatInfoList[overlayColorBits.A-1].Green)
+						screenPixels[curPixelBit] = twist(pixColorBits.G, maskColorBits.G,
+							formatInfoList[maskColorBits.A-1].ColorTransform, formatInfoList[maskColorBits.A-1].Green)
 						curPixelBit++
-						screenPixels[curPixelBit] = twist(pixColorBits.B, overlayColorBits.B,
-							formatInfoList[overlayColorBits.A-1].ColorTransform, formatInfoList[overlayColorBits.A-1].Blue)
+						screenPixels[curPixelBit] = twist(pixColorBits.B, maskColorBits.B,
+							formatInfoList[maskColorBits.A-1].ColorTransform, formatInfoList[maskColorBits.A-1].Blue)
 						curPixelBit++
 						screenPixels[curPixelBit] = 255
 						curPixelBit++
@@ -415,10 +472,10 @@ func twist(component1 uint8, component2 uint8, op Operation, reqcomponent uint8)
 	}
 }
 
-func parseFormat(formatStrList []string, statsStruct *stats) ([]displayInfo, error) {
+func parseFormat(formatStrList []string, statsStruct *stats, templates []*template.Template) ([]displayInfo, error) {
 	var err error
 	allinfo := []displayInfo{}
-	for _, formatStr := range formatStrList {
+	for idx, formatStr := range formatStrList {
 		info := displayInfo{}
 		format := strings.Split(formatStr, ";")
 		updatedX, updatedY, updatedC := false, false, false
@@ -482,7 +539,20 @@ func parseFormat(formatStrList []string, statsStruct *stats) ([]displayInfo, err
 			info.Blue = 255
 		}
 		if statsStruct != nil {
-			info.Output = strings.ReplaceAll(info.Template, "{ram}", strconv.FormatUint(statsStruct.Ram, 10))
+			curInfoTemplate := infoTemplate{
+				TotalRam:  humanize.Bytes(statsStruct.Ram.Total),
+				UsedRam:   humanize.Bytes(statsStruct.Ram.Used),
+				FreeRam:   humanize.Bytes(statsStruct.Ram.Free),
+				TotalSwap: humanize.Bytes(statsStruct.Swap.Total),
+				UsedSwap:  humanize.Bytes(statsStruct.Swap.Used),
+				FreeSwap:  humanize.Bytes(statsStruct.Swap.Free),
+				CpuUser:   strconv.FormatUint(statsStruct.CpuDelta.User, 10),
+				CpuSystem: strconv.FormatUint(statsStruct.CpuDelta.System, 10),
+				CpuIdle:   strconv.FormatUint(statsStruct.CpuDelta.Idle, 10),
+			}
+			var b bytes.Buffer
+			templates[idx].Execute(&b, curInfoTemplate)
+			info.Output = b.String()
 		}
 		allinfo = append(allinfo, info)
 	}
