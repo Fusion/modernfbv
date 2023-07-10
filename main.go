@@ -264,11 +264,11 @@ func main() {
 			for x := imageContext.image_xoffset; x < imageContext.image_xoffset+imageContext.image_width; x++ {
 				pixColor := imageContext.image.At(x, y)
 				pixColorBits := pixColor.(color.NRGBA)
-				screenPixels[curPixelBit] = pixColorBits.R
+				screenPixels[curPixelBit] = pixColorBits.B
 				curPixelBit++
 				screenPixels[curPixelBit] = pixColorBits.G
 				curPixelBit++
-				screenPixels[curPixelBit] = pixColorBits.B
+				screenPixels[curPixelBit] = pixColorBits.R
 				curPixelBit++
 				screenPixels[curPixelBit] = pixColorBits.A
 				curPixelBit++
