@@ -1,5 +1,6 @@
 SHELL := /bin/bash
-BUILD_FLAGS=-s -w
+VERSION ?= v1.0.0
+BUILD_FLAGS=-s -w -X main.version=${VERSION}
 TRIM_FLAGS=
 
 build:

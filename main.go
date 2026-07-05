@@ -1,38 +1,40 @@
 package main
 
 import (
-	"C"
-	"fmt"
-	"os"
-)
-import (
 	"bytes"
+	_ "embed"
+	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	"image/jpeg"
 	"image/png"
+	"os"
+	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+	"text/template"
 	"time"
 	"unsafe"
 
-	"text/template"
-
-	"github.com/eiannone/keyboard"
-	"golang.org/x/image/font"
-	"golang.org/x/image/font/basicfont"
-	"golang.org/x/image/math/fixed"
-	"golang.org/x/sys/unix"
-
 	arg "github.com/alexflint/go-arg"
 	"github.com/disintegration/imaging"
-
 	"github.com/dustin/go-humanize"
+	"github.com/eiannone/keyboard"
 	"github.com/mackerelio/go-osstat/cpu"
 	"github.com/mackerelio/go-osstat/memory"
+	"golang.org/x/image/font"
+	"golang.org/x/image/font/opentype"
+	"golang.org/x/image/math/fixed"
+	"golang.org/x/sys/unix"
 )
+
+//go:embed fontface.otf
+var fontFaceData []byte
+
+var version = "v1.0.0"
 
 type fb_bitfield struct {
 	offset    uint32
@@ -78,6 +80,10 @@ type fb_var_screeninfo struct {
 
 const FBIOGET_FSCREENINFO = 0x4602
 const FBIOGET_VSCREENINFO = 0x4600
+const FBIOPAN_DISPLAY = 0x4606
+const KDSETMODE = 0x4B3A
+const KD_TEXT = 0x00
+const KD_GRAPHICS = 0x01
 
 type args struct {
 	ImgPath    []string `arg:"positional,required"`
@@ -88,11 +94,14 @@ type args struct {
 	Redraw     int      `help:"keep re-rendering image every n seconds, hiding console output"`
 	Stats      bool     `help:"display server statistics"`
 	Format     []string `arg:"separate" help:"display format for statistics"`
+	TextRot    int      `help:"text orientation (0, 90, 180, 270)"`
+	TextScale  int      `help:"text scale, a multiplier"`
+	Overlay    string   `help:"a picture to overlay, for instance as a text background"`
 	Verbose    bool
 }
 
 type imgContext struct {
-	image          image.Image
+	image          *image.NRGBA
 	image_width    int
 	image_height   int
 	image_xoffset  int
@@ -157,10 +166,15 @@ func (args) Description() string {
 	return "Display an image in your graphical console using the frame buffer.\nYou may apply multiple transformations.\n"
 }
 
+func (args) Version() string {
+	return version
+}
+
 func main() {
 	var args args
 	arg.MustParse(&args)
 
+	// Check that formats are parseable
 	formatInfo, err := parseFormat(args.Format, nil, nil)
 	if err != nil {
 		fmt.Println(err)
@@ -177,6 +191,28 @@ func main() {
 		templates = append(templates, oneGoTemplate)
 	}
 
+	if args.TextScale == 0 {
+		args.TextScale = 1
+	} else if args.TextScale < 0 {
+		fmt.Println("text scale must be positive")
+		return
+	}
+
+	if !validTextRotation(args.TextRot) {
+		fmt.Println("text orientation must be one of 0, 90, 180, 270")
+		return
+	}
+
+	if len(formatInfo) > 255 {
+		fmt.Println("at most 255 format entries are supported")
+		return
+	}
+
+	if args.Redraw < 0 {
+		fmt.Println("redraw interval must be zero or positive")
+		return
+	}
+
 	fbF, err := os.OpenFile(args.DevicePath, os.O_RDWR, os.ModeDevice)
 	if err != nil {
 		fmt.Println(err)
@@ -184,19 +220,12 @@ func main() {
 	}
 	defer fbF.Close()
 
-	if args.NoCursor {
-		fbT, err := os.OpenFile("/dev/console", unix.O_WRONLY, 0)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-		defer func() {
-			fbT.WriteString("\033[?25h")
-			time.Sleep(1 * time.Second)
-			fbT.Close()
-		}()
-		fbT.WriteString("\033[?25l")
+	restoreConsole, err := setupConsole(args.Redraw > 0, args.NoCursor, args.Verbose)
+	if err != nil {
+		fmt.Println(err)
+		return
 	}
+	defer restoreConsole()
 
 	screeninfo := fb_var_screeninfo{}
 	uscreeninfo := unsafe.Pointer(&screeninfo)
@@ -208,8 +237,31 @@ func main() {
 	screen_width := int(screeninfo.xres)
 	screen_height := int(screeninfo.yres)
 	bpp := int(screeninfo.bits_per_pixel / 8)
+	if bpp != 4 {
+		fmt.Println("only 32-bit framebuffers are supported")
+		return
+	}
 	if args.Verbose {
 		fmt.Println("Screen information:", screen_width, screen_height, bpp)
+	}
+
+	var overlay image.Image
+	if args.Overlay != "" {
+		overlay, err = decodeImage(args.Overlay)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+	}
+
+	var fontFaces []font.Face
+	if len(formatInfo) > 0 {
+		fontFaces, err = buildFontFaces(formatInfo, args.TextScale)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		defer closeFontFaces(fontFaces)
 	}
 
 	imageContexts := []imgContext{}
@@ -217,19 +269,7 @@ func main() {
 	for _, imgPath := range args.ImgPath {
 		imageContext := imgContext{}
 
-		imgF, err := os.Open(imgPath)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-		defer imgF.Close()
-
-		var img image.Image
-		if strings.HasSuffix(imgPath, ".png") {
-			img, err = png.Decode(imgF)
-		} else if strings.HasSuffix(imgPath, ".jpg") || strings.HasSuffix(imgPath, ".jpeg") {
-			img, err = jpeg.Decode(imgF)
-		}
+		img, err := decodeImage(imgPath)
 		if err != nil {
 			fmt.Println(err)
 			return
@@ -282,19 +322,12 @@ func main() {
 			}
 		}
 
-		_, ok := wImg.At(0, 0).(color.NRGBA)
-		if !ok {
-			convertedImg := image.NewNRGBA(image.Rect(0, 0, wImg.Bounds().Dx(), wImg.Bounds().Dy()))
-			draw.Draw(convertedImg, convertedImg.Bounds(), wImg, wImg.Bounds().Min, draw.Src)
-			wImg = convertedImg
-		}
-
-		imageContext.image = wImg
-		imageContext.image_width = wImg.Bounds().Max.X
+		imageContext.image = toNRGBA(wImg)
+		imageContext.image_width = imageContext.image.Bounds().Dx()
 		if imageContext.image_width > screen_width {
 			imageContext.image_width = screen_width
 		}
-		imageContext.image_height = wImg.Bounds().Max.Y
+		imageContext.image_height = imageContext.image.Bounds().Dy()
 		if imageContext.image_height > screen_height {
 			imageContext.image_height = screen_height
 		}
@@ -317,6 +350,7 @@ func main() {
 		return
 	}
 	defer syscall.Munmap(screenPixels)
+	framePixels := make([]byte, len(screenPixels))
 
 	keysEvents, err := keyboard.GetKeys(1)
 	if err != nil {
@@ -326,14 +360,20 @@ func main() {
 	defer func() {
 		_ = keyboard.Close()
 	}()
+	signalEvents := make(chan os.Signal, 1)
+	signal.Notify(signalEvents, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signalEvents)
 
 	curImageContextIdx := 0
 	curStats := stats{}
+	frameNumber := 0
 	for {
 		if !args.DontClear {
-			for i := 0; i < screen_height*screen_width*4; i++ {
-				screenPixels[i] = 0
+			for i := 0; i < len(framePixels); i++ {
+				framePixels[i] = 0
 			}
+		} else {
+			copy(framePixels, screenPixels)
 		}
 
 		if args.Verbose {
@@ -341,37 +381,6 @@ func main() {
 		}
 		imageContext := imageContexts[curImageContextIdx]
 
-		//
-		memory, err := memory.Get()
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-		curStats.Ram = ramStatsDetail{Total: memory.Total, Used: memory.Used, Free: memory.Free}
-		curStats.Swap = ramStatsDetail{Total: memory.SwapTotal, Used: memory.SwapUsed, Free: memory.SwapFree}
-		cpu, err := cpu.Get()
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-		curStats.CpuDelta.Total = cpu.Total - curStats.CpuInstant.Total
-		curStats.CpuDelta.User = uint64(float64(cpu.User-curStats.CpuInstant.User) / float64(curStats.CpuDelta.Total) * 100)
-		curStats.CpuDelta.System = uint64(float64(cpu.System-curStats.CpuInstant.System) / float64(curStats.CpuDelta.Total) * 100)
-		curStats.CpuDelta.Idle = uint64(float64(cpu.Idle-curStats.CpuInstant.Idle) / float64(curStats.CpuDelta.Total) * 100)
-		curStats.CpuInstant = cpuStatsDetail{Total: cpu.Total, User: cpu.User, System: cpu.System, Idle: cpu.Idle}
-		//
-		/*
-			fontBytes, err := ioutil.ReadFile("luxisr.ttf")
-			if err != nil {
-				fmt.Println(err)
-				return
-			}
-				workFont, err := freetype.ParseFont(fontBytes)
-				if err != nil {
-					fmt.Println(err)
-					return
-				}
-		*/
 		// If we need to display e.g. stats, we are going to create a mask, that we will
 		// then use on the existing picture.
 		// As any basic mask, it is going to use black and white only.
@@ -379,63 +388,98 @@ func main() {
 		var mask *image.NRGBA
 		var formatInfoList []displayInfo
 		if args.Stats {
+			err = updateStats(&curStats)
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+
 			// Format:
-			// "X100;Y100;S12;C255,255,255;RAM:{{.TotalRam}}"
+			// "X:100;Y:100;S:12;C:255,255,255;RAM:{{.TotalRam}}"
 			// C: can be
 			// - R,G,B
 			// - xor
 			// Missing X or Y: try to center
 			formatInfoList, _ = parseFormat(args.Format, &curStats, templates)
-			mask = image.NewNRGBA(image.Rect(0, 0, screen_width, screen_height))
+			if args.TextRot == 0 || args.TextRot == 180 {
+				mask = image.NewNRGBA(image.Rect(0, 0, screen_width, screen_height))
+			} else {
+				mask = image.NewNRGBA(image.Rect(0, 0, screen_height, screen_width))
+			}
 			for idx, formatInfo := range formatInfoList {
-				pt := fixed.Point26_6{X: fixed.I(formatInfo.X), Y: fixed.I(formatInfo.Y)}
 				d := &font.Drawer{
 					Dst:  mask,
-					Src:  image.NewUniform(color.RGBA{255, 255, 255, uint8(idx + 1)}),
-					Face: basicfont.Face7x13,
-					Dot:  pt,
+					Src:  image.NewUniform(color.NRGBA{R: 255, G: 255, B: 255, A: uint8(idx + 1)}),
+					Face: fontFaces[idx],
+					Dot:  fixed.Point26_6{X: fixed.I(formatInfo.X), Y: fixed.I(formatInfo.Y)},
 				}
 				d.DrawString(formatInfo.Output)
 			}
+
+			if args.TextRot == 180 {
+				mask = imaging.Rotate180(mask)
+			} else if args.TextRot == 90 {
+				mask = imaging.Rotate90(mask)
+			} else if args.TextRot == 270 {
+				mask = imaging.Rotate270(mask)
+			}
 		}
-		//
+		textLayerCount := uint8(len(formatInfoList))
 
 		curPixelBit := (imageContext.screen_yoffset*screen_width + imageContext.screen_xoffset) * 4
 		for y := imageContext.image_yoffset; y < imageContext.image_yoffset+imageContext.image_height; y++ {
+			screenY := imageContext.screen_yoffset + y - imageContext.image_yoffset
 			for x := imageContext.image_xoffset; x < imageContext.image_xoffset+imageContext.image_width; x++ {
+				screenX := imageContext.screen_xoffset + x - imageContext.image_xoffset
 				pixColor := imageContext.image.At(x, y)
 				pixColorBits := pixColor.(color.NRGBA)
+				if overlay != nil {
+					pixColorBits = blendOverlay(pixColorBits, overlay, screenX, screenY)
+				}
 				if args.Stats {
-					maskColor := mask.At(x, y)
+					maskColor := mask.At(screenX, screenY)
 					maskColorBits := maskColor.(color.NRGBA)
 					if maskColorBits.A != 0 {
-						screenPixels[curPixelBit] = twist(pixColorBits.R, maskColorBits.R,
-							formatInfoList[maskColorBits.A-1].ColorTransform, formatInfoList[maskColorBits.A-1].Red)
+						var idx uint8
+						if maskColorBits.A >= textLayerCount {
+							idx = textLayerCount - 1
+						} else {
+							idx = maskColorBits.A - 1
+						}
+						framePixels[curPixelBit] = twist(pixColorBits.B, maskColorBits.B,
+							formatInfoList[idx].ColorTransform, formatInfoList[idx].Blue)
 						curPixelBit++
-						screenPixels[curPixelBit] = twist(pixColorBits.G, maskColorBits.G,
-							formatInfoList[maskColorBits.A-1].ColorTransform, formatInfoList[maskColorBits.A-1].Green)
+						framePixels[curPixelBit] = twist(pixColorBits.G, maskColorBits.G,
+							formatInfoList[idx].ColorTransform, formatInfoList[idx].Green)
 						curPixelBit++
-						screenPixels[curPixelBit] = twist(pixColorBits.B, maskColorBits.B,
-							formatInfoList[maskColorBits.A-1].ColorTransform, formatInfoList[maskColorBits.A-1].Blue)
+						framePixels[curPixelBit] = twist(pixColorBits.R, maskColorBits.R,
+							formatInfoList[idx].ColorTransform, formatInfoList[idx].Red)
 						curPixelBit++
-						screenPixels[curPixelBit] = 255
+						framePixels[curPixelBit] = 255
 						curPixelBit++
 						continue
 					}
 				}
-				screenPixels[curPixelBit] = pixColorBits.R
+				framePixels[curPixelBit] = pixColorBits.B
 				curPixelBit++
-				screenPixels[curPixelBit] = pixColorBits.G
+				framePixels[curPixelBit] = pixColorBits.G
 				curPixelBit++
-				screenPixels[curPixelBit] = pixColorBits.B
+				framePixels[curPixelBit] = pixColorBits.R
 				curPixelBit++
-				screenPixels[curPixelBit] = pixColorBits.A
+				framePixels[curPixelBit] = pixColorBits.A
 				curPixelBit++
 			}
 			if screen_width > imageContext.image_width {
 				curPixelBit += (screen_width - imageContext.image_width) * 4
 			}
 		}
+
+		copy(screenPixels, framePixels)
+		flushFramebuffer(fbF, screenPixels, &screeninfo, args.Verbose)
+		if args.Verbose {
+			fmt.Println("Rendered frame:", frameNumber, "image:", curImageContextIdx, "next redraw:", args.Redraw)
+		}
+		frameNumber++
 
 		if len(imageContexts) == curImageContextIdx+1 {
 			if args.Redraw == 0 {
@@ -453,6 +497,8 @@ func main() {
 				if event.Key == keyboard.KeyEsc {
 					return
 				}
+			case <-signalEvents:
+				return
 			default:
 			}
 
@@ -470,6 +516,225 @@ func twist(component1 uint8, component2 uint8, op Operation, reqcomponent uint8)
 	default:
 		return reqcomponent
 	}
+}
+
+func blendOverlay(base color.NRGBA, overlay image.Image, screenX int, screenY int) color.NRGBA {
+	point := image.Point{X: screenX, Y: screenY}
+	if !point.In(overlay.Bounds()) {
+		return base
+	}
+
+	top := color.NRGBAModel.Convert(overlay.At(screenX, screenY)).(color.NRGBA)
+	if top.A == 0 {
+		return base
+	}
+	if top.A == 255 {
+		return top
+	}
+
+	alpha := uint32(top.A)
+	invAlpha := 255 - alpha
+	return color.NRGBA{
+		R: uint8((uint32(top.R)*alpha + uint32(base.R)*invAlpha) / 255),
+		G: uint8((uint32(top.G)*alpha + uint32(base.G)*invAlpha) / 255),
+		B: uint8((uint32(top.B)*alpha + uint32(base.B)*invAlpha) / 255),
+		A: 255,
+	}
+}
+
+func flushFramebuffer(fbF *os.File, screenPixels []byte, screeninfo *fb_var_screeninfo, verbose bool) {
+	err := unix.Msync(screenPixels, unix.MS_SYNC)
+	if err != nil && verbose {
+		fmt.Println("Framebuffer sync:", err)
+	}
+
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fbF.Fd(), FBIOPAN_DISPLAY, uintptr(unsafe.Pointer(screeninfo)))
+	if errno != 0 && verbose {
+		fmt.Println("Framebuffer pan:", errno)
+	}
+}
+
+func setupConsole(graphicsMode bool, hideCursor bool, verbose bool) (func(), error) {
+	if !graphicsMode && !hideCursor {
+		return func() {}, nil
+	}
+
+	console, consolePath, err := openConsole(graphicsMode)
+	if err != nil {
+		return nil, err
+	}
+	if verbose {
+		fmt.Println("Using console:", consolePath)
+	}
+
+	if hideCursor {
+		_, _ = console.WriteString("\033[?25l")
+	}
+
+	return func() {
+		if graphicsMode {
+			_ = setConsoleMode(console, KD_TEXT)
+		}
+		if hideCursor {
+			_, _ = console.WriteString("\033[?25h")
+			time.Sleep(1 * time.Second)
+		}
+		_ = console.Close()
+	}, nil
+}
+
+func setConsoleMode(console *os.File, mode int) error {
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, console.Fd(), KDSETMODE, uintptr(mode))
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func openConsole(requireGraphicsMode bool) (*os.File, string, error) {
+	var lastErr error
+	for _, path := range []string{"/dev/tty", "/dev/tty0", "/dev/console"} {
+		console, err := os.OpenFile(path, unix.O_RDWR, 0)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if !requireGraphicsMode {
+			return console, path, nil
+		}
+
+		err = setConsoleMode(console, KD_GRAPHICS)
+		if err == nil {
+			return console, path, nil
+		}
+
+		lastErr = fmt.Errorf("%s: %w", path, err)
+		_ = console.Close()
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no usable console device found")
+	}
+	return nil, "", lastErr
+}
+
+func decodeImage(path string) (image.Image, error) {
+	imgF, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer imgF.Close()
+
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".png":
+		return png.Decode(imgF)
+	case ".jpg", ".jpeg":
+		return jpeg.Decode(imgF)
+	default:
+		return nil, fmt.Errorf("unsupported image format: %s", path)
+	}
+}
+
+func toNRGBA(src image.Image) *image.NRGBA {
+	if img, ok := src.(*image.NRGBA); ok {
+		return img
+	}
+
+	bounds := src.Bounds()
+	dst := image.NewNRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
+	draw.Draw(dst, dst.Bounds(), src, bounds.Min, draw.Src)
+	return dst
+}
+
+func buildFontFaces(formatInfo []displayInfo, textScale int) ([]font.Face, error) {
+	parsedFont, err := opentype.Parse(fontFaceData)
+	if err != nil {
+		return nil, fmt.Errorf("parse font data: %w", err)
+	}
+
+	faces := make([]font.Face, 0, len(formatInfo))
+	for _, info := range formatInfo {
+		face, err := opentype.NewFace(parsedFont, &opentype.FaceOptions{
+			Size:    float64(info.Size * textScale),
+			DPI:     72.0,
+			Hinting: font.HintingNone,
+		})
+		if err != nil {
+			closeFontFaces(faces)
+			return nil, fmt.Errorf("build font face: %w", err)
+		}
+		faces = append(faces, face)
+	}
+
+	return faces, nil
+}
+
+func closeFontFaces(fontFaces []font.Face) {
+	for _, fontFace := range fontFaces {
+		closer, ok := fontFace.(interface{ Close() error })
+		if !ok {
+			continue
+		}
+		_ = closer.Close()
+	}
+}
+
+func validTextRotation(textRotation int) bool {
+	switch textRotation {
+	case 0, 90, 180, 270:
+		return true
+	default:
+		return false
+	}
+}
+
+func updateStats(curStats *stats) error {
+	memoryInfo, err := memory.Get()
+	if err != nil {
+		return err
+	}
+	curStats.Ram = ramStatsDetail{Total: memoryInfo.Total, Used: memoryInfo.Used, Free: memoryInfo.Free}
+	curStats.Swap = ramStatsDetail{Total: memoryInfo.SwapTotal, Used: memoryInfo.SwapUsed, Free: memoryInfo.SwapFree}
+
+	cpuInfo, err := cpu.Get()
+	if err != nil {
+		return err
+	}
+
+	previous := curStats.CpuInstant
+	current := cpuStatsDetail{Total: cpuInfo.Total, User: cpuInfo.User, System: cpuInfo.System, Idle: cpuInfo.Idle}
+	curStats.CpuDelta = cpuStatsDetail{}
+	if previous.Total != 0 && current.Total > previous.Total {
+		totalDelta := current.Total - previous.Total
+		curStats.CpuDelta = cpuStatsDetail{
+			Total:  totalDelta,
+			User:   percentage(current.User-previous.User, totalDelta),
+			System: percentage(current.System-previous.System, totalDelta),
+			Idle:   percentage(current.Idle-previous.Idle, totalDelta),
+		}
+	}
+	curStats.CpuInstant = current
+
+	return nil
+}
+
+func percentage(component uint64, total uint64) uint64 {
+	if total == 0 {
+		return 0
+	}
+	return component * 100 / total
+}
+
+func parseColorComponent(component string) (uint8, error) {
+	value, err := strconv.Atoi(component)
+	if err != nil {
+		return 0, err
+	}
+	if value < 0 || value > 255 {
+		return 0, fmt.Errorf("color component out of range: %d", value)
+	}
+	return uint8(value), nil
 }
 
 func parseFormat(formatStrList []string, statsStruct *stats, templates []*template.Template) ([]displayInfo, error) {
@@ -497,6 +762,9 @@ func parseFormat(formatStrList []string, statsStruct *stats, templates []*templa
 				if err != nil {
 					return allinfo, err
 				}
+				if info.Size < 1 {
+					return allinfo, fmt.Errorf("text size must be positive: %d", info.Size)
+				}
 			} else if strings.HasPrefix(hint, "C:") {
 				transform := hint[2:]
 				if transform == "xor" {
@@ -505,19 +773,21 @@ func parseFormat(formatStrList []string, statsStruct *stats, templates []*templa
 					info.ColorTransform = Or
 				} else {
 					colors := strings.Split(hint[2:], ",")
-					red, err := strconv.Atoi(colors[0])
+					if len(colors) != 3 {
+						return allinfo, fmt.Errorf("invalid color format: %s", hint[2:])
+					}
+					info.Red, err = parseColorComponent(colors[0])
 					if err != nil {
 						return allinfo, err
 					}
-					green, err := strconv.Atoi(colors[1])
+					info.Green, err = parseColorComponent(colors[1])
 					if err != nil {
 						return allinfo, err
 					}
-					blue, err := strconv.Atoi(colors[2])
+					info.Blue, err = parseColorComponent(colors[2])
 					if err != nil {
 						return allinfo, err
 					}
-					info.Red, info.Green, info.Blue = uint8(red), uint8(green), uint8(blue)
 				}
 				updatedC = true
 			} else {
@@ -551,7 +821,10 @@ func parseFormat(formatStrList []string, statsStruct *stats, templates []*templa
 				CpuIdle:   strconv.FormatUint(statsStruct.CpuDelta.Idle, 10),
 			}
 			var b bytes.Buffer
-			templates[idx].Execute(&b, curInfoTemplate)
+			err = templates[idx].Execute(&b, curInfoTemplate)
+			if err != nil {
+				return allinfo, err
+			}
 			info.Output = b.String()
 		}
 		allinfo = append(allinfo, info)
